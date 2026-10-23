@@ -1,7 +1,105 @@
 # Imports
 import cv2
 import time
-from ultralytics import YOLO
+import threading
+
+from yolo import YOLOSystem
+
+# -------------------------
+# YOLO TARGET SCORING
+# -------------------------
+
+def calculate_yolo_target_score(
+    detection,
+    tracked_position,
+    current_yolo_target_id
+):
+
+    x1, y1, x2, y2 = detection["box"]
+
+    center_x = (x1 + x2) // 2
+    center_y = (y1 + y2) // 2
+
+    width = x2 - x1
+    height = y2 - y1
+
+    confidence = detection["confidence"]
+
+    # -------------------------
+    # CONFIDENCE SCORE
+    # -------------------------
+
+    confidence_score = confidence * 40
+
+    # -------------------------
+    # SIZE SCORE
+    # -------------------------
+
+    object_area = width * height
+
+    size_score = min(
+        object_area / 10000,
+        1
+    ) * 20
+
+    # -------------------------
+    # DISTANCE SCORE
+    # -------------------------
+
+    distance_score = 0
+
+    if tracked_position is not None:
+
+        distance = (
+            (
+                center_x
+                -
+                tracked_position[0]
+            ) ** 2
+            +
+            (
+                center_y
+                -
+                tracked_position[1]
+            ) ** 2
+        ) ** 0.5
+
+        distance_score = max(
+            0,
+            30 - (distance / 10)
+        )
+
+    # -------------------------
+    # CURRENT TARGET BONUS
+    # -------------------------
+
+    target_bonus = 0
+
+    if (
+        current_yolo_target_id is not None
+        and
+        detection["object_id"]
+        ==
+        current_yolo_target_id
+    ):
+
+        target_bonus = 20
+
+    # -------------------------
+    # FINAL SCORE
+    # -------------------------
+
+    total_score = (
+        confidence_score
+        +
+        size_score
+        +
+        distance_score
+        +
+        target_bonus
+    )
+
+    return total_score
 
 # -------------------------
 # DECLARATIONS
@@ -25,10 +123,23 @@ no_motion_frames = 0
 
 target_locked = False
 target_id = 1
+yolo_target_id = None
+target_switch_requested = False
 target_lost_frames = 0
+
+hud_enabled = True
+# -------------------------
+# AUTOMATIC TARGET SWITCHING
+# -------------------------
+
+target_switch_score_margin = 15
+target_switch_confirmations = 3
+target_switch_counter = 0
+
 
 tracked_position = None
 tracked_box = None
+
 
 target_velocity_x = 0
 target_velocity_y = 0
@@ -86,15 +197,40 @@ previous_target_speed = 0
 # TARGET MOVEMENT STATE
 target_movement_state = "STATIONARY"
 
-# -------------------------
-# YOLO
-# -------------------------
+# ==================================================
+# HUD LAYOUT
+# ==================================================
 
-yolo_model = YOLO("yolo11n.pt")
+HUD_LEFT_X = 20
 
-yolo_results = None
-yolo_frame_counter = 0
-yolo_interval = 30
+# TOP HEADER
+HUD_TOP_Y = 30
+
+# MAIN STATUS
+HUD_STATUS_X = 20
+HUD_STATUS_Y = 150
+HUD_STATUS_SPACING = 23
+
+# SYSTEM PANEL
+HUD_SYSTEM_X = 450
+HUD_SYSTEM_Y = 30
+HUD_SYSTEM_SPACING = 20
+
+# BOTTOM OBJECT PANEL
+HUD_OBJECT_X = 20
+HUD_OBJECT_Y = 350
+
+# BOTTOM TARGET PANEL
+HUD_TARGET_X = 390
+HUD_TARGET_Y = 350
+
+HUD_PANEL_SPACING = 18
+
+# -------------------------
+# YOLO FEATURE
+# -------------------------
+yolo = YOLOSystem()
+
 
 # -------------------------
 # START ARACHNE
@@ -147,20 +283,324 @@ while True:
         break
 
     # ==================================================
-    # YOLO RECOGNITION
+    # YOLO FEATURE
     # ==================================================
 
-    yolo_frame_counter += 1
+    yolo.run(frame)
 
-    if yolo_frame_counter >= yolo_interval:
+    yolo_detections = yolo.get_detections()
 
-        yolo_results = yolo_model(
-            frame,
-            imgsz=320,
-            verbose=False
+    # -------------------------
+    # YOLO TARGET SCORES
+    # -------------------------
+
+    for detection in yolo_detections:
+
+        detection["target_score"] = (
+            calculate_yolo_target_score(
+                detection,
+                tracked_position,
+                yolo_target_id
+            )
+        )
+        # -------------------------
+        # YOLO TARGET LOSS RECOVERY
+        # -------------------------
+
+        yolo_target_visible = False
+
+        if yolo_target_id is not None:
+
+            for detection in yolo_detections:
+
+                if detection["object_id"] == yolo_target_id:
+
+                    yolo_target_visible = True
+                    break
+
+
+        if (
+            target_locked
+            and
+            yolo_target_id is not None
+            and
+            not yolo_target_visible
+        ):
+
+            print(
+                f"YOLO TARGET LOST → "
+                f"ID {yolo_target_id}"
+            )
+
+            yolo_target_id = None
+
+            target_switch_counter = 0
+# -------------------------
+# AUTOMATIC TARGET PRIORITY
+# -------------------------
+
+    if yolo_detections and target_locked:
+
+        best_target = max(
+            yolo_detections,
+            key=lambda detection: detection["target_score"]
+        )
+    
+
+        current_target = None
+
+        for detection in yolo_detections:
+
+            if detection["object_id"] == yolo_target_id:
+                current_target = detection
+
+                break
+
+        if current_target is not None:
+
+            current_score = current_target["target_score"]
+            best_score = best_target["target_score"]
+
+            score_difference = best_score - current_score
+
+            if (
+                best_target["object_id"] != yolo_target_id
+                and
+                score_difference >= target_switch_score_margin
+            ):
+
+                target_switch_counter += 1
+
+            else:
+
+                target_switch_counter = 0
+
+            if target_switch_counter >= target_switch_confirmations:
+
+                yolo_target_id = best_target["object_id"]
+
+                x1, y1, x2, y2 = best_target["box"]
+
+                tracked_position = (
+                    (x1 + x2) // 2,
+                    (y1 + y2) // 2
+                )
+
+                tracked_box = (
+                    x1,
+                    y1,
+                    x2 - x1,
+                    y2 - y1
+                )
+
+                target_width = x2 - x1
+                target_height = y2 - y1
+
+                target_lost_frames = 0
+                tracking_prediction_frames = 0
+
+                target_switch_counter = 0
+
+                print(
+                    f"AUTO TARGET SWITCH → "
+                    f"YOLO ID {yolo_target_id}"
+                )
+
+    # -------------------------
+    # TARGET SWITCHING
+    # -------------------------
+
+    if target_switch_requested:
+
+        if len(yolo_detections) > 1:
+
+            available_targets = []
+
+            for detection in yolo_detections:
+
+                if detection["object_id"] != yolo_target_id:
+
+                    available_targets.append(detection)
+
+            if available_targets:
+
+                next_target = max(
+                    available_targets,
+                    key=lambda detection: detection["confidence"]
+                )
+
+                yolo_target_id = next_target["object_id"]
+
+                x1, y1, x2, y2 = next_target["box"]
+
+                tracked_position = (
+                    (x1 + x2) // 2,
+                    (y1 + y2) // 2
+                )
+
+                tracked_box = (
+                    x1,
+                    y1,
+                    x2 - x1,
+                    y2 - y1
+                )
+
+                target_width = x2 - x1
+                target_height = y2 - y1
+
+                target_lost_frames = 0
+                tracking_prediction_frames = 0
+
+                print(
+                    f"TARGET SWITCHED → YOLO ID "
+                    f"{yolo_target_id}"
+                )
+
+        target_switch_requested = False
+
+        
+    # -------------------------
+    # YOLO TARGET SELECTION
+    # -------------------------
+
+    if yolo_detections:
+
+        best_detection = max(
+            yolo_detections,
+            key=lambda detection: detection["confidence"]
         )
 
-        yolo_frame_counter = 0
+        yolo_target_box = best_detection["box"]
+        yolo_target_class = best_detection["class_name"]
+        yolo_target_confidence = best_detection["confidence"]
+
+    else:
+
+        yolo_target_box = None
+        yolo_target_class = None
+        yolo_target_confidence = 0
+
+    # -------------------------
+    # YOLO → TARGET ASSOCIATION
+    # -------------------------
+
+    yolo_associated_target = None
+
+    if target_locked and tracked_position is not None:
+
+        # -------------------------
+        # TRY EXISTING YOLO TARGET
+        # -------------------------
+
+        if yolo_target_id is not None:
+
+            for detection in yolo_detections:
+
+                if detection["object_id"] == yolo_target_id:
+
+                    yolo_associated_target = detection
+
+                    break
+
+        # -------------------------
+        # FIND NEW YOLO TARGET
+        # -------------------------
+
+        if yolo_associated_target is None:
+
+            closest_yolo_distance = 150
+
+            for detection in yolo_detections:
+
+                x1, y1, x2, y2 = detection["box"]
+
+                yolo_center_x = (x1 + x2) // 2
+                yolo_center_y = (y1 + y2) // 2
+
+                distance = (
+                    (
+                        yolo_center_x
+                        -
+                        tracked_position[0]
+                    ) ** 2
+                    +
+                    (
+                        yolo_center_y
+                        -
+                        tracked_position[1]
+                    ) ** 2
+                ) ** 0.5
+
+                if distance < closest_yolo_distance:
+
+                    closest_yolo_distance = distance
+
+                    yolo_associated_target = detection
+
+            # Remember the newly associated target
+
+            if yolo_associated_target is not None:
+
+                yolo_target_id = (
+                    yolo_associated_target["object_id"]
+                )
+
+        # -------------------------
+        # YOLO ASSOCIATION DISPLAY
+        # -------------------------
+    if hud_enabled:
+
+        if yolo_associated_target is not None:
+
+            associated_id = yolo_associated_target["object_id"]
+
+            associated_class = yolo_associated_target["class_name"]
+
+            associated_confidence = (
+                yolo_associated_target["confidence"]
+            )
+
+            cv2.putText(
+                frame,
+                f"LOCKED YOLO: ID {associated_id}",
+                (350, 390),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 0, 0),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"CLASS: {associated_class}",
+                (350, 415),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 0, 0),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"CONF: {associated_confidence:.2f}",
+                (350, 440),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 0, 0),
+                2
+            )
+
+        else:
+
+            cv2.putText(
+                frame,
+                "LOCKED YOLO: NONE",
+                (350, 390),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 0, 0),
+                2
+            )
     # ==================================================
     # MOTION DETECTION
     # ==================================================
@@ -424,425 +864,326 @@ while True:
         if selected_candidate is not None:
 
             motion_detected = True
-
             target_locked = True
             target_lost_frames = 0
 
             x, y, w, h, center_x, center_y, area = selected_candidate
 
+            # -------------------------
+            # TRACKING TIMER
+            # -------------------------
 
             if target_tracking_start is None:
-
                 target_tracking_start = time.time()
 
-                    # -------------------------
-                    # TARGET POSITION
-                    # -------------------------
+            # -------------------------
+            # SMOOTH TARGET POSITION
+            # -------------------------
 
-                if tracked_position is None:
+            if tracked_position is None:
 
-                        tracked_position = (
-                            center_x,
-                            center_y
-                        )
+                tracked_position = (center_x, center_y)
 
-                else:
-
-                        smooth_x = int(
-                            tracked_position[0]
-                            +
-                            (
-                                center_x
-                                -
-                                tracked_position[0]
-                            )
-                            *
-                            position_smoothing
-                        )
-
-                        smooth_y = int(
-                            tracked_position[1]
-                            +
-                            (
-                                center_y
-                                -
-                                tracked_position[1]
-                            )
-                            *
-                            position_smoothing
-                        )
-
-                        target_velocity_x = (
-                            smooth_x
-                            -
-                            tracked_position[0]
-                        )
-
-                        target_velocity_y = (
-                            smooth_y
-                            -
-                            tracked_position[1]
-                        )
-
-                        #-------------------------
-                        # TARGET SPEED
-                        #-------------------------
-                        target_velocity_x = (
-                            smooth_x
-                            -
-                            tracked_position[0]
-                        )
-
-                        target_velocity_y = (
-                            smooth_y
-                            -
-                            tracked_position[1]
-                        )
-
-                        tracked_position = (
-                            smooth_x,
-                            smooth_y
-                        )
-                        # -------------------------
-                        # TARGET ACCELERATION
-                        # -------------------------
-                
-                        tracked_position = (
-                            smooth_x,
-                            smooth_y
-                        )
-
-                tracked_box = (
-                    x,
-                    y,
-                    w,
-                    h
-                )
-
-                target_width = w
-                target_height = h
-        
-        # -------------------------
-        # TARGET DISTANCE
-        # -------------------------
-
-        if target_height > 0:
-
-            target_distance = 1000 / target_height
-
-            if target_distance < 3:
-
-                target_distance_status = "NEAR"
-
-            elif target_distance < 7:
-
-                target_distance_status = "MEDIUM"
+                target_velocity_x = 0
+                target_velocity_y = 0
 
             else:
 
-                target_distance_status = "FAR"
+                old_x, old_y = tracked_position
 
-        # -------------------------
-            # DISTANCE TREND
-            # -------------------------
-
-            if target_distance_previous > 0:
-
-                distance_difference = (
-                    target_distance
-                    -
-                    target_distance_previous
+                smooth_x = int(
+                    old_x
+                    + (center_x - old_x) * position_smoothing
                 )
 
-                if distance_difference < -0.15:
+                smooth_y = int(
+                    old_y
+                    + (center_y - old_y) * position_smoothing
+                )
 
-                    target_distance_trend = "APPROACHING"
+                target_velocity_x = smooth_x - old_x
+                target_velocity_y = smooth_y - old_y
 
-                elif distance_difference > 0.15:
-
-                    target_distance_trend = "MOVING AWAY"
-
-                else:
-
-                    target_distance_trend = "STABLE"
-
-
-            target_distance_previous = target_distance
+                tracked_position = (smooth_x, smooth_y)
 
             # -------------------------
-            # FIND CENTRE
+            # CONSISTENT BOUNDING BOX
             # -------------------------
 
-            center_x = x + w // 2
+            smooth_x, smooth_y = tracked_position
 
-            center_y = y + h // 2
-
-
-            current_position = (
-                center_x,
-                center_y
+            tracked_box = (
+                smooth_x - w // 2,
+                smooth_y - h // 2,
+                w,
+                h
             )
 
+            target_width = w
+            target_height = h
 
-            # ==================================================
+            # -------------------------
+            # TARGET DISTANCE
+            # -------------------------
+
+            if target_height > 0:
+
+                target_distance = 1000 / target_height
+
+                if target_distance < 3:
+                    target_distance_status = "NEAR"
+                elif target_distance < 7:
+                    target_distance_status = "MEDIUM"
+                else:
+                    target_distance_status = "FAR"
+
+                # -------------------------
+                # DISTANCE TREND
+                # -------------------------
+
+                if target_distance_previous > 0:
+
+                    distance_difference = (
+                        target_distance - target_distance_previous
+                    )
+
+                    if distance_difference < -0.15:
+                        target_distance_trend = "APPROACHING"
+                    elif distance_difference > 0.15:
+                        target_distance_trend = "MOVING AWAY"
+                    else:
+                        target_distance_trend = "STABLE"
+
+                target_distance_previous = target_distance
+
+            # -------------------------
+            # SAVE SMOOTHED POSITION
+            # -------------------------
+
+            current_position = tracked_position
+
+            # -------------------------
             # MOVEMENT ANALYSIS
-            # ==================================================
+            # -------------------------
 
             if len(position_history) > 0:
 
                 previous_x, previous_y = position_history[-1]
 
-
-                # -------------------------
-                # DIFFERENCE IN POSITION
-                # -------------------------
-
-                dx = center_x - previous_x
-
-                dy = center_y - previous_y
-
-                #-------------------------
-                # DIRECTION CONSISTENCY CHECK
-                #-------------------------
+                dx = current_position[0] - previous_x
+                dy = current_position[1] - previous_y
 
                 previous_direction_x = dx
                 previous_direction_y = dy
 
+                # Speed
+                speed = (dx ** 2 + dy ** 2) ** 0.5
 
-                # -------------------------
-                # CALCULATE SPEED
-                # -------------------------
-
-                speed = (
-                    (dx ** 2 + dy ** 2) ** 0.5
-                )
-
-
-                # -------------------------
-                # SMOOTH SPEED
-                # -------------------------
-
+                # Smooth speed
                 previous_target_speed = smoothed_speed
 
                 smoothed_speed = (
                     smoothed_speed * 0.5
-                ) + (
-                    speed * 0.5
+                    + speed * 0.5
                 )
 
-                # -------------------------
-                # TARGET ACCELERATION
-                # -------------------------
-
+                # Acceleration
                 target_acceleration = (
-                    smoothed_speed
-                    -
-                    previous_target_speed
+                    smoothed_speed - previous_target_speed
                 )
 
-                # -------------------------
-                # TARGET MOVEMENT STATE
-                # -------------------------
-
+                # Movement state
                 if smoothed_speed < 2:
-
                     target_movement_state = "STATIONARY"
-
                 elif target_acceleration > 0.5:
-
                     target_movement_state = "ACCELERATING"
-
                 elif target_acceleration < -0.5:
-
                     target_movement_state = "DECELERATING"
-
                 else:
-
                     target_movement_state = "MOVING"
-                # ==================================================
-                # DIRECTION
-                # ==================================================
 
+                # Direction
                 if abs(dx) > abs(dy):
 
                     if dx > 5:
-
                         direction = "RIGHT"
-
                     elif dx < -5:
-
                         direction = "LEFT"
-
 
                 else:
 
                     if dy > 5:
-
                         direction = "DOWN"
-
                     elif dy < -5:
-
                         direction = "UP"
 
-
-                # ==================================================
-                # MOVEMENT CLASSIFICATION
-                # ==================================================
-
+                # Movement classification
                 if smoothed_speed < 2:
-
                     movement_status = "STATIONARY"
-
-
                 elif smoothed_speed < 6:
-
                     movement_status = "SLOW"
-
-
                 elif smoothed_speed < 12:
-
                     movement_status = "MEDIUM"
-
-
                 else:
-
                     movement_status = "FAST"
 
-
             # -------------------------
-            # SAVE POSITION
+            # SAVE POSITION HISTORY
             # -------------------------
 
-            position_history.append(
-                current_position
-            )
+            position_history.append(current_position)
 
             if len(position_history) > 20:
                 position_history.pop(0)
 
-                
+            # ==================================================
+            # YOLO VISUALISATION
+            # ==================================================
+        if hud_enabled:
+
+            for detection in yolo_detections:
+
+                x1, y1, x2, y2 = detection["box"]
+
+                class_name = detection["class_name"]
+
+                confidence = detection["confidence"]
+
+                object_id = detection["object_id"]
+
+                cv2.rectangle(
+                    frame,
+                    (x1, y1),
+                    (x2, y2),
+                    (255, 0, 0),
+                    2
+                )
+
+                target_score = detection["target_score"]
+
+                yolo_label = (
+                    f"ID {object_id} | "
+                    f"{class_name} "
+                    f"{confidence:.2f} "
+                    f"S:{target_score:.1f}"
+                )
+
+                cv2.putText(
+                    frame,
+                    yolo_label,
+                    (x1, max(y1 - 10, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 0, 0),
+                    2
+                )
             # ==================================================
             # MOTION VISUALIZATION
             # ==================================================
 
             # Motion box
 
-            cv2.rectangle(
-                frame,
-                (x, y),
-                (x + w, y + h),
-                (255, 255, 255),
-                2
-            )
+            if hud_enabled and tracked_box is not None:
 
-            # ==================================================
-            # TARGET LOCK RETICLE
-            # ==================================================
+                box_x, box_y, box_w, box_h = tracked_box
 
-            if target_locked:
-
-                corner_length = 15
-
-
-                # -------------------------
-                # TOP LEFT
-                # -------------------------
-
-                cv2.line(
+                cv2.rectangle(
                     frame,
-                    (x, y),
-                    (x + corner_length, y),
-                    (255, 255, 255),
-                    2
-                )
-
-                cv2.line(
-                    frame,
-                    (x, y),
-                    (x, y + corner_length),
+                    (box_x, box_y),
+                    (box_x + box_w, box_y + box_h),
                     (255, 255, 255),
                     2
                 )
 
 
-                # -------------------------
-                # TOP RIGHT
-                # -------------------------
+            
+                # ==================================================
+                # TARGET LOCK RETICLE
+                # ==================================================
 
-                cv2.line(
-                    frame,
-                    (x + w, y),
-                    (x + w - corner_length, y),
-                    (255, 255, 255),
-                    2
-                )
+                if hud_enabled and target_locked and tracked_box is not None:
+                    box_x, box_y, box_w, box_h = tracked_box
+                    corner_length = 15
 
-                cv2.line(
-                    frame,
-                    (x + w, y),
-                    (x + w, y + corner_length),
-                    (255, 255, 255),
-                    2
-                )
+                    # TOP LEFT
+                    cv2.line(
+                        frame,
+                        (box_x, box_y),
+                        (box_x + corner_length, box_y),
+                        (255, 255, 255),
+                        2
+                    )
+                    cv2.line(
+                        frame,
+                        (box_x, box_y),
+                        (box_x, box_y + corner_length),
+                        (255, 255, 255),
+                        2
+                    )
 
+                    # TOP RIGHT
+                    cv2.line(
+                        frame,
+                        (box_x + box_w, box_y),
+                        (box_x + box_w - corner_length, box_y),
+                        (255, 255, 255),
+                        2
+                    )
+                    cv2.line(
+                        frame,
+                        (box_x + box_w, box_y),
+                        (box_x + box_w, box_y + corner_length),
+                        (255, 255, 255),
+                        2
+                    )
 
-                # -------------------------
-                # BOTTOM LEFT
-                # -------------------------
+                    # BOTTOM LEFT
+                    cv2.line(
+                        frame,
+                        (box_x, box_y + box_h),
+                        (box_x + corner_length, box_y + box_h),
+                        (255, 255, 255),
+                        2
+                    )
+                    cv2.line(
+                        frame,
+                        (box_x, box_y + box_h),
+                        (box_x, box_y + box_h - corner_length),
+                        (255, 255, 255),
+                        2
+                    )
 
-                cv2.line(
-                    frame,
-                    (x, y + h),
-                    (x + corner_length, y + h),
-                    (255, 255, 255),
-                    2
-                )
+                    # BOTTOM RIGHT
+                    cv2.line(
+                        frame,
+                        (box_x + box_w, box_y + box_h),
+                        (box_x + box_w - corner_length, box_y + box_h),
+                        (255, 255, 255),
+                        2
+                    )
+                    cv2.line(
+                        frame,
+                        (box_x + box_w, box_y + box_h),
+                        (box_x + box_w, box_y + box_h - corner_length),
+                        (255, 255, 255),
+                        2
+                    )
 
-                cv2.line(
-                    frame,
-                    (x, y + h),
-                    (x, y + h - corner_length),
-                    (255, 255, 255),
-                    2
-                )
-
-
-                # -------------------------
-                # BOTTOM RIGHT
-                # -------------------------
-
-                cv2.line(
-                    frame,
-                    (x + w, y + h),
-                    (x + w - corner_length, y + h),
-                    (255, 255, 255),
-                    2
-                )
-
-                cv2.line(
-                    frame,
-                    (x + w, y + h),
-                    (x + w, y + h - corner_length),
-                    (255, 255, 255),
-                    2
-                )
-
-
-            # Centre point
-
-            cv2.circle(
-                frame,
-                (center_x, center_y),
-                5,
-                (255, 255, 255),
-                -1
-            )
+                    # TARGET CENTRE
+                    if tracked_position is not None:
+                        cv2.circle(
+                            frame,
+                            (int(tracked_position[0]), int(tracked_position[1])),
+                            5,
+                            (255, 255, 255),
+                            -1
+                        )
 
     # ==================================================
     # MOVEMENT TRAIL
     # ==================================================
 
-    if len(position_history) > 1:
+    if hud_enabled and len(position_history) > 1:
 
         trail_points = len(position_history)
 
@@ -873,7 +1214,7 @@ while True:
     # PROJECTED MOVEMENT VECTOR
     # ==================================================
 
-    if target_locked and tracked_position is not None:
+    if ( hud_enabled and target_locked and tracked_position is not None):
 
         vector_start_x = tracked_position[0]
         vector_start_y = tracked_position[1]
@@ -1032,12 +1373,15 @@ while True:
 
     #TARGET PREDICTION HUD TEXT
 
-    if not motion_detected and target_locked:
+    if (hud_enabled 
+    and 
+    not motion_detected and target_locked
+    ):
 
         cv2.putText(
             frame,
             "TARGET PREDICTING",
-            (20, 390),
+            (20, 300),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             (255, 255, 255),
@@ -1074,415 +1418,466 @@ while True:
             time.time() - target_tracking_start
         )
 
+    
     # ==================================================
     # ARACHNE HUD
     # ==================================================
-
-    # -------------------------
-    # TITLE
-    # -------------------------
-
-    cv2.putText(
-        frame,
-        "ARACHNE V0.1",
-        (20, 35),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (255, 255, 255),
-        2
-    )
-
-
-    # -------------------------
-    # FPS
-    # -------------------------
-
-    cv2.putText(
-        frame,
-        f"FPS: {fps}",
-        (20, 70),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-
-
-    # -------------------------
-    # VISION
-    # -------------------------
-
-    cv2.putText(
-        frame,
-        "VISION: ONLINE",
-        (20, 105),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-
-
-    # -------------------------
-    # SYSTEM
-    # -------------------------
-
-    cv2.putText(
-        frame,
-        "SYSTEM: NORMAL",
-        (20, 140),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-
-
-    # -------------------------
-    # MOTION
-    # -------------------------
-
-    if motion_detected:
+    if hud_enabled:
+        #TITLE
 
         cv2.putText(
             frame,
-            "MOTION DETECTED",
-            (20, 175),
+            "ARACHNE V0.1",
+            (HUD_LEFT_X, HUD_TOP_Y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            0.8,
             (255, 255, 255),
             2
         )
 
-    else:
+        cv2.putText(
+            frame,
+            f"FPS: {fps}",
+            (HUD_LEFT_X, HUD_TOP_Y + 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2
+        )
 
         cv2.putText(
             frame,
-            "MOTION: CLEAR",
-            (20, 175),
+            "VISION: ONLINE",
+            (HUD_LEFT_X, HUD_TOP_Y + 55),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            0.55,
+            (255, 255, 255),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            "SYSTEM: NORMAL",
+            (HUD_LEFT_X, HUD_TOP_Y + 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
             (255, 255, 255),
             2
         )
 
 
-    # -------------------------
-    # DIRECTION
-    # -------------------------
+        # ==================================================
+        # TRACKING STATUS
+        # ==================================================
 
-    cv2.putText(
+        status_y = HUD_STATUS_Y
+
+        if motion_detected:
+            motion_text = "MOTION: DETECTED"
+        else:
+            motion_text = "MOTION: CLEAR"
+
+        cv2.putText(
+            frame,
+            motion_text,
+            (HUD_STATUS_X, status_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1
+        )
+
+        status_y += HUD_STATUS_SPACING
+
+        cv2.putText(
+            frame,
+            f"DIRECTION: {direction}",
+            (HUD_STATUS_X, status_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1
+        )
+
+        status_y += HUD_STATUS_SPACING
+
+        cv2.putText(
+            frame,
+            f"SPEED: {smoothed_speed:.1f} PX/FRAME",
+            (HUD_STATUS_X, status_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1
+        )
+
+        status_y += HUD_STATUS_SPACING
+
+        cv2.putText(
+            frame,
+            f"MOVEMENT: {movement_status}",
+            (HUD_STATUS_X, status_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1
+        )
+
+        status_y += HUD_STATUS_SPACING
+
+        if target_locked:
+            target_text = f"TARGET {target_id}: LOCKED"
+        else:
+            target_text = "TARGET: SEARCHING"
+
+        cv2.putText(
+            frame,
+            target_text,
+            (HUD_STATUS_X, status_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1
+        )
+
+        # ==================================================
+        # TARGETING RETICLE
+        # ==================================================
+    if hud_enabled:
+        
+        center_x = 320
+        center_y = 240
+
+        box_size = 80
+
+        left = center_x - box_size
+        right = center_x + box_size
+
+        top = center_y - box_size
+        bottom = center_y + box_size
+
+        corner_length = 20
+
+
+        # -------------------------
+        # TOP LEFT
+        # -------------------------
+
+        cv2.line(
+            frame,
+            (left, top),
+            (left + corner_length, top),
+            (255, 255, 255),
+            2
+        )
+
+        cv2.line(
+            frame,
+            (left, top),
+            (left, top + corner_length),
+            (255, 255, 255),
+            2
+        )
+
+
+        # -------------------------
+        # TOP RIGHT
+        # -------------------------
+
+        cv2.line(
+            frame,
+            (right, top),
+            (right - corner_length, top),
+            (255, 255, 255),
+            2
+        )
+
+        cv2.line(
+            frame,
+            (right, top),
+            (right, top + corner_length),
+            (255, 255, 255),
+            2
+        )
+
+
+        # -------------------------
+        # BOTTOM LEFT
+        # -------------------------
+
+        cv2.line(
+            frame,
+            (left, bottom),
+            (left + corner_length, bottom),
+            (255, 255, 255),
+            2
+        )
+
+        cv2.line(
+            frame,
+            (left, bottom),
+            (left, bottom - corner_length),
+            (255, 255, 255),
+            2
+        )
+
+
+        # -------------------------
+        # BOTTOM RIGHT
+        # -------------------------
+
+        cv2.line(
+            frame,
+            (right, bottom),
+            (right - corner_length, bottom),
+            (255, 255, 255),
+            2
+        )
+
+        cv2.line(
+            frame,
+            (right, bottom),
+            (right, bottom - corner_length),
+            (255, 255, 255),
+            2
+        )
+
+
+        # -------------------------
+        # CENTER CROSSHAIR
+        # -------------------------
+
+        cv2.line(
+            frame,
+            (center_x - 10, center_y),
+            (center_x + 10, center_y),
+            (255, 255, 255),
+            1
+        )
+
+        cv2.line(
+            frame,
+            (center_x, center_y - 10),
+            (center_x, center_y + 10),
+            (255, 255, 255),
+            1
+        )
+
+
+        # ==================================================
+        # INFORMATION PANEL
+        # ==================================================
+    if hud_enabled:
+
+        panel_x = 450
+        panel_y = 30
+
+
+        cv2.putText(
+            frame,
+            "ARACHNE SYSTEM",
+            (panel_x, panel_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1
+        )
+
+
+        cv2.putText(
+            frame,
+            "CAMERA   ONLINE",
+            (panel_x, panel_y + 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1
+        )
+
+
+        cv2.putText(
+            frame,
+            "VISION   READY",
+            (panel_x, panel_y + 45),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1
+        )
+
+
+        cv2.putText(
+            frame,
+            "AI       STANDBY",
+            (panel_x, panel_y + 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1
+        )
+
+        cv2.putText(
         frame,
-        f"DIRECTION: {direction}",
-        (20, 210),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-
-
-    # -------------------------
-    # SPEED
-    # -------------------------
-
-    cv2.putText(
-        frame,
-        f"SPEED: {smoothed_speed:.1f} PX/FRAME",
-        (20, 245),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-
-
-    # -------------------------
-    # MOVEMENT
-    # -------------------------
-
-    cv2.putText(
-        frame,
-        f"MOVEMENT: {movement_status}",
-        (20, 280),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-
-
-    # -------------------------
-    # TARGET STATUS
-    # -------------------------
-
-    if target_locked:
-
-        target_text = f"TARGET {target_id}: LOCKED"
-
-    else:
-
-        target_text = "TARGET: SEARCHING"
-
-
-    cv2.putText(
-        frame,
-        target_text,
-        (20, 315),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-    #-------------------------
-    # TARGET CONFIDENCE
-    #-------------------------
-    cv2.putText(
-        frame,
-        f"CONFIDENCE: {target_confidence}%",
-        (20, 340),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-
-#Tracking Timing
-    cv2.putText(
-        frame,
-        f"TRACK TIME: {target_tracking_time:.1f}s",
-        (20, 365),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-    # ==================================================
-    # TARGETING RETICLE
-    # ==================================================
-
-    center_x = 320
-    center_y = 240
-
-    box_size = 80
-
-    left = center_x - box_size
-    right = center_x + box_size
-
-    top = center_y - box_size
-    bottom = center_y + box_size
-
-    corner_length = 20
-
-
-    # -------------------------
-    # TOP LEFT
-    # -------------------------
-
-    cv2.line(
-        frame,
-        (left, top),
-        (left + corner_length, top),
-        (255, 255, 255),
-        2
-    )
-
-    cv2.line(
-        frame,
-        (left, top),
-        (left, top + corner_length),
-        (255, 255, 255),
-        2
-    )
-
-
-    # -------------------------
-    # TOP RIGHT
-    # -------------------------
-
-    cv2.line(
-        frame,
-        (right, top),
-        (right - corner_length, top),
-        (255, 255, 255),
-        2
-    )
-
-    cv2.line(
-        frame,
-        (right, top),
-        (right, top + corner_length),
-        (255, 255, 255),
-        2
-    )
-
-
-    # -------------------------
-    # BOTTOM LEFT
-    # -------------------------
-
-    cv2.line(
-        frame,
-        (left, bottom),
-        (left + corner_length, bottom),
-        (255, 255, 255),
-        2
-    )
-
-    cv2.line(
-        frame,
-        (left, bottom),
-        (left, bottom - corner_length),
-        (255, 255, 255),
-        2
-    )
-
-
-    # -------------------------
-    # BOTTOM RIGHT
-    # -------------------------
-
-    cv2.line(
-        frame,
-        (right, bottom),
-        (right - corner_length, bottom),
-        (255, 255, 255),
-        2
-    )
-
-    cv2.line(
-        frame,
-        (right, bottom),
-        (right, bottom - corner_length),
-        (255, 255, 255),
-        2
-    )
-
-
-    # -------------------------
-    # CENTER CROSSHAIR
-    # -------------------------
-
-    cv2.line(
-        frame,
-        (center_x - 10, center_y),
-        (center_x + 10, center_y),
-        (255, 255, 255),
-        1
-    )
-
-    cv2.line(
-        frame,
-        (center_x, center_y - 10),
-        (center_x, center_y + 10),
-        (255, 255, 255),
-        1
-    )
-    
-    #=====================================
-    #PREDICTION CONFIDENCE
-    #=====================================
-    cv2.putText(
-    frame,
-    f"PREDICTION: {prediction_confidence}%",
-    (20, 415),
-    cv2.FONT_HERSHEY_SIMPLEX,
-    0.6,
-    (255, 255, 255),
-    2
-)
-
-    #Target Distance 
-    cv2.putText(
-        frame,
-        f"DISTANCE: {target_distance_status}",
-        (20, 440),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-    cv2.putText(
-    frame,
-    f"TREND: {target_distance_trend}",
-    (20, 465),
-    cv2.FONT_HERSHEY_SIMPLEX,
-    0.6,
-    (255, 255, 255),
-    2
-)
-
-    # ==================================================
-    # INFORMATION PANEL
-    # ==================================================
-
-    panel_x = 450
-    panel_y = 30
-
-
-    cv2.putText(
-        frame,
-        "ARACHNE SYSTEM",
-        (panel_x, panel_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (255, 255, 255),
-        1
-    )
-
-
-    cv2.putText(
-        frame,
-        "CAMERA   ONLINE",
-        (panel_x, panel_y + 25),
+        f"ACCEL   {target_acceleration:.1f}",
+        (panel_x, panel_y + 85),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.45,
         (255, 255, 255),
         1
-    )
+        )
+        cv2.putText(
+            frame,
+            f"STATE   {target_movement_state}",
+            (panel_x, panel_y + 105),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1
+        )
 
+        # ==================================================
+        # MULTI-TARGET INFORMATION PANEL
+        # ==================================================
+    if hud_enabled:
 
-    cv2.putText(
-        frame,
-        "VISION   READY",
-        (panel_x, panel_y + 45),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
-        (255, 255, 255),
-        1
-    )
+        panel_x = HUD_OBJECT_X
+        panel_y = HUD_OBJECT_Y
 
+        cv2.putText(
+            frame,
+            "VISION OBJECTS",
+            (panel_x, panel_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 0, 0),
+            2
+        )
 
-    cv2.putText(
-        frame,
-        "AI       STANDBY",
-        (panel_x, panel_y + 65),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
-        (255, 255, 255),
-        1
-    )
+        panel_y += HUD_PANEL_SPACING
 
-    cv2.putText(
-    frame,
-    f"ACCEL   {target_acceleration:.1f}",
-    (panel_x, panel_y + 85),
-    cv2.FONT_HERSHEY_SIMPLEX,
-    0.45,
-    (255, 255, 255),
-    1
-)
-    cv2.putText(
-        frame,
-        f"STATE   {target_movement_state}",
-        (panel_x, panel_y + 105),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
-        (255, 255, 255),
-        1
-    )
+        for detection in yolo_detections:
 
+            object_id = detection["object_id"]
+            class_name = detection["class_name"]
+            confidence = detection["confidence"]
 
+            target_marker = ""
+
+            if object_id == yolo_target_id:
+
+                target_marker = " <TARGET>"
+
+            object_text = (
+                f"ID {object_id} | "
+                f"{class_name.upper()} | "
+                f"{confidence:.2f}"
+                f"{target_marker}"
+            )
+
+            cv2.putText(
+                frame,
+                object_text,
+                (panel_x, panel_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 0, 0),
+                1
+            )
+
+            panel_y += HUD_PANEL_SPACING
+            
+        # ==================================================
+        # TARGET ANALYTICS PANEL
+        # ==================================================
+    if hud_enabled:
+
+        analytics_x = HUD_TARGET_X
+        analytics_y = HUD_TARGET_Y
+
+        cv2.putText(
+            frame,
+            "TARGET ANALYTICS",
+            (analytics_x, analytics_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 0, 0),
+            2
+        )
+
+        analytics_y += HUD_PANEL_SPACING
+
+        if target_locked:
+
+            target_class_display = "UNKNOWN"
+            target_confidence_display = 0
+
+            if yolo_associated_target is not None:
+
+                target_class_display = (
+                    yolo_associated_target["class_name"]
+                )
+
+                target_confidence_display = (
+                    yolo_associated_target["confidence"]
+                )
+
+            analytics_lines = [
+
+                f"ID: {yolo_target_id}",
+
+                f"CLASS: "
+                f"{target_class_display.upper()}",
+
+                f"CONF: "
+                f"{target_confidence_display:.2f}",
+
+                f"DIST: "
+                f"{target_distance:.1f}",
+
+                f"TREND: "
+                f"{target_distance_trend}",
+
+                f"SPEED: "
+                f"{smoothed_speed:.1f}",
+
+                f"DIRECTION: "
+                f"{direction}",
+
+                f"STATE: "
+                f"{target_movement_state}",
+
+                f"ACCEL: "
+                f"{target_acceleration:.1f}",
+
+                f"TRACK: "
+                f"{target_tracking_time:.1f}s"
+            ]
+
+            for line in analytics_lines:
+
+                cv2.putText(
+                    frame,
+                    line,
+                    (analytics_x, analytics_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42,
+                    (255, 0, 0),
+                    1
+                )
+
+                analytics_y += HUD_PANEL_SPACING
+
+        else:
+
+            cv2.putText(
+                frame,
+                "NO TARGET",
+                (analytics_x, analytics_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 0, 0),
+                2
+            )
     # ==================================================
     # DISPLAY
     # ==================================================
@@ -1497,7 +1892,32 @@ while True:
     # QUIT
     # -------------------------
 
-    if cv2.waitKey(1) & 0xFF == ord("q"):
+    key = cv2.waitKey(1) & 0xFF
+
+    # -------------------------
+    # TARGET SWITCH
+    # -------------------------
+
+    if key == ord("t"):
+
+        target_switch_requested = True
+
+    #-----------------------------
+    #Enable/Disable HUD
+    #----------------------------
+    if key == ord("h"):
+        hud_enabled = not hud_enabled
+
+        if hud_enabled:
+            print("HUD: ENABLED")
+        else:
+            print("HUD: DISABLED")
+
+    # -------------------------
+    # QUIT
+    # -------------------------
+
+    if key == ord("q"):
 
         break
 
